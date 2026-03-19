@@ -1,0 +1,20 @@
+=== Evaluation Summary ===
+         ep_rew_mean: -0.1343463206291199
+          ep_rew_std: 0.05152150965325919
+         ep_len_mean: 16.84
+     final_norm_mean: 9.579100880622864
+        success_rate: 0.0
+          n_episodes: 50.0
+
+=== Hover Recovery Test ===
+        hover_trials: 50.0
+  hover_success_rate: 0.0
+     hover_successes: 0.0
+        hover_finite: 50.0
+
+=== ROA-like Sweep ===
+         roa_samples: 200.0
+    roa_success_rate: 0.0
+      roa_avg_return: -0.12212989469990135
+       roa_successes: 0.0
+          roa_finite: 200.0

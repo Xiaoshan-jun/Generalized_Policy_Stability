@@ -71,7 +71,7 @@ def main():
         test_env = gym.make("Pendulum-v1", render_mode="human")
         print("Using standard Gymnasium environment")
 
-    # Determine model paths
+    # ----- Determine model paths and see if we need to load previous checkpoint-----------------------------------------------------------------
     standard_model_path = os.path.join(args.save_dir, args.algo, "pendulum.zip")
     model_path = os.path.join(args.save_dir, f"{args.algo}_pendulum")
     env_suffix = "_modified" if args.use_modified_env else "_standard"
