@@ -1,0 +1,8 @@
+k_path: /media/jxiang9143/AIDataset/github/Generalized_Policy_Stability/nonlinear_system/quadrotor3d/saved_models/lqr_single/K_discrete_dt_0.01.npy
+num_samples: 200000
+val_split: 0.1
+epochs: 60
+best_val_mse: 0.0043512200
+best_model: saved_models/imitation_lqr_single/imitation_policy_lqr_single_best.pth
+final_model: saved_models/imitation_lqr_single/imitation_policy_lqr_single_final.pth
+dataset: saved_models/imitation_lqr_single/lqr_single_imitation_dataset.npz

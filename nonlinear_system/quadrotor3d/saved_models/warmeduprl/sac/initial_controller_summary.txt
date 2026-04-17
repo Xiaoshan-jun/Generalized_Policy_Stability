@@ -1,0 +1,10 @@
+algo: sac
+seed: 0
+reached_equilibrium: False
+first_reach_step: None
+episode_return: -92.005081
+steps: 42
+best_pos_err: 4.484510
+best_angle_err: 1.826094
+best_vel_err: 0.845853
+best_omega_err: 0.230850

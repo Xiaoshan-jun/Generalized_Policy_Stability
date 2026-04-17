@@ -1,0 +1,12 @@
+local_lqr_library: /media/jxiang9143/AIDataset/github/Generalized_Policy_Stability/nonlinear_system/quadrotor3d/saved_models/lqr/local_lqr_library.npz
+dataset_pairs: 83736
+expert_episodes: 200
+expert_return_mean: 43.626529
+expert_return_std: 80.304383
+best_val_mse: 1.16828595e-01
+eval_return_mean: 21.009342
+eval_return_std: 63.219976
+best_model: nonlinear_system/quadrotor3d/saved_models/imitation_lqr/imitation_policy_lqr_best.pth
+final_model: nonlinear_system/quadrotor3d/saved_models/imitation_lqr/imitation_policy_lqr_final.pth
+dataset: nonlinear_system/quadrotor3d/saved_models/imitation_lqr/lqr_imitation_dataset.npz
+loss_plot: nonlinear_system/quadrotor3d/saved_models/imitation_lqr/imitation_training_loss.png

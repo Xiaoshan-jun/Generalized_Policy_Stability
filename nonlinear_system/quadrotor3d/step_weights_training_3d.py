@@ -46,8 +46,8 @@ class StepNetTrainer3D:
         env,
         algo_type: str = "ppo",
         n_steps: int = 20,
-        hidden_dim: int = 128,
-        n_layers: int = 3,
+        hidden_dim: int = 256,
+        n_layers: int = 4,
         alpha: float = 0.05,
         beta: float = 0.01,
         initial_lr: float = 2e-4,
@@ -483,7 +483,7 @@ def main():
 
     env = Quadrotor3DEnv(dt=0.01, max_time=2.0)
 
-    algo = "ppo"  # "ppo" or "sac"
+    algo = "sac"  # "ppo" or "sac"
     n_steps = 15
     n_epochs = 1000
     batch_size = 256
@@ -498,8 +498,8 @@ def main():
             env=env,
             algo_type=algo,
             n_steps=n_steps,
-            hidden_dim=128,
-            n_layers=3,
+            hidden_dim=256,
+            n_layers=4,
             alpha=0.05,
             beta=0.01,
             initial_lr=2e-4,

@@ -14,7 +14,7 @@ import matplotlib
 import numpy as np
 import torch
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize
@@ -38,11 +38,56 @@ class StageConfig:
     verbose: int = 0
     log_interval: int = 10
     normalize_reward: bool = True
+    curriculum_init_scale: float = 0.2
+    curriculum_scale_step: float = 0.05
+    curriculum_success_threshold: float = 0.5
+    curriculum_window: int = 100
+
+
+class CurriculumCallback(BaseCallback):
+    """Increase reset scale only when recent success rate >= threshold."""
+
+    def __init__(self, init_scale=0.2, scale_step=0.05, success_threshold=0.5, window=100, verbose=1):
+        super().__init__(verbose)
+        self._scale            = float(init_scale)
+        self.scale_step        = float(scale_step)
+        self.success_threshold = float(success_threshold)
+        self.window            = int(window)
+        self._recent: list     = []
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get("infos", []):
+            if "episode" not in info:
+                continue
+            self._recent.append(bool(info.get("reached_equilibrium", False)))
+            if len(self._recent) > self.window:
+                self._recent.pop(0)
+            if len(self._recent) == self.window and self._scale < 1.0:
+                rate = sum(self._recent) / self.window
+                if rate >= self.success_threshold:
+                    old = self._scale
+                    self._scale = min(1.0, self._scale + self.scale_step)
+                    self._recent.clear()
+                    self.training_env.env_method("set_scale", self._scale)
+                    if self.verbose >= 1:
+                        print(
+                            f"  [curriculum] step={self.num_timesteps:,}  "
+                            f"success={rate:.2f}  scale {old:.3f} -> {self._scale:.3f}"
+                        )
+        return True
 
 
 class PitchStabilizationEnv(Quadrotor2DEnv):
-    def __init__(self, dt=0.01, max_time=2.0):
+    def __init__(self, dt=0.01, max_time=2.0, init_scale=1.0):
         super().__init__(dt=dt, max_time=max_time)
+        self._x_lo_full = self.x_lo.clone()
+        self._x_up_full = self.x_up.clone()
+        self.set_scale(init_scale)
+
+    def set_scale(self, scale: float):
+        s = float(np.clip(scale, 0.0, 1.0))
+        self.x_lo = self._x_lo_full * s
+        self.x_up = self._x_up_full * s
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -102,10 +147,10 @@ class PitchStabilizationEnv(Quadrotor2DEnv):
 
 
 class PositionStabilizationEnv(Quadrotor2DEnv):
-    def __init__(self, dt=0.01, max_time=2.0, small_angle_limit=0.12):
+    def __init__(self, dt=0.01, max_time=2.0, small_angle_limit=0.12, init_scale=1.0):
         super().__init__(dt=dt, max_time=max_time)
         self.small_angle_limit = float(small_angle_limit)
-        self.reset_x_lo = torch.tensor(
+        self._reset_x_lo_full = torch.tensor(
             [
                 float(self.x_lo[0]),
                 float(self.x_lo[1]),
@@ -116,7 +161,7 @@ class PositionStabilizationEnv(Quadrotor2DEnv):
             ],
             dtype=self.dtype,
         )
-        self.reset_x_up = torch.tensor(
+        self._reset_x_up_full = torch.tensor(
             [
                 float(self.x_up[0]),
                 float(self.x_up[1]),
@@ -127,6 +172,14 @@ class PositionStabilizationEnv(Quadrotor2DEnv):
             ],
             dtype=self.dtype,
         )
+        self.reset_x_lo = self._reset_x_lo_full.clone()
+        self.reset_x_up = self._reset_x_up_full.clone()
+        self.set_scale(init_scale)
+
+    def set_scale(self, scale: float):
+        s = float(np.clip(scale, 0.0, 1.0))
+        self.reset_x_lo = self._reset_x_lo_full * s
+        self.reset_x_up = self._reset_x_up_full * s
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -198,13 +251,13 @@ class TwoStageQuadrotorPolicy:
 
 
 class EquilibriumPrintCallback(BaseCallback):
-    def __init__(self, stage_name: str, print_every_episodes: int = 20, verbose: int = 0):
+    def __init__(self, stage_name: str, print_every_episodes: int = 500, verbose: int = 0):
         super().__init__(verbose=verbose)
         self.stage_name = stage_name
         self.print_every_episodes = int(print_every_episodes)
-        self.success_count = 0
         self.episode_count = 0
-        self.episode_rewards = []
+        self._recent_rewards: list = []
+        self._recent_success: list = []
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -218,27 +271,21 @@ class EquilibriumPrintCallback(BaseCallback):
                 continue
 
             self.episode_count += 1
-            reward = None
             if isinstance(info.get("episode"), dict):
-                reward = info["episode"].get("r")
-                if reward is not None:
-                    self.episode_rewards.append(float(reward))
+                r = info["episode"].get("r")
+                if r is not None:
+                    self._recent_rewards.append(float(r))
+            self._recent_success.append(bool(info.get("reached_equilibrium", False)))
 
-            reached_equilibrium = bool(info.get("reached_equilibrium", False))
-            if reached_equilibrium:
-                self.success_count += 1
-
-            if (
-                self.print_every_episodes > 0
-                and self.episode_count % self.print_every_episodes == 0
-                and len(self.episode_rewards) > 0
-            ):
-                window = self.episode_rewards[-self.print_every_episodes :]
-                avg_reward = sum(window) / len(window)
-                success_rate = self.success_count / float(self.episode_count)
+            if self.episode_count % self.print_every_episodes == 0:
+                w = self.print_every_episodes
+                avg_reward   = np.mean(self._recent_rewards[-w:]) if self._recent_rewards else float("nan")
+                success_rate = np.mean(self._recent_success[-w:])
                 print(
-                    f"[{self.stage_name}] episodes {self.episode_count - len(window) + 1}-{self.episode_count}: "
-                    f"avg_reward={avg_reward:.3f}, success_rate={success_rate:.3f}"
+                    f"[{self.stage_name}] ep={self.episode_count:>7,}  "
+                    f"steps={self.num_timesteps:>10,}  "
+                    f"avg_ret={avg_reward:+.2f}  "
+                    f"success={success_rate:.2f}"
                 )
 
         return True
@@ -272,6 +319,7 @@ def build_model(algo, env, seed, device, verbose):
         )
 
     if algo == "sac":
+        n_envs = env.num_envs if hasattr(env, "num_envs") else 1
         return SAC(
             "MlpPolicy",
             env,
@@ -283,7 +331,7 @@ def build_model(algo, env, seed, device, verbose):
             gamma=0.99,
             learning_rate=3e-4,
             train_freq=1,
-            gradient_steps=1,
+            gradient_steps=max(1, n_envs),
         )
 
     raise ValueError("algo must be 'ppo' or 'sac'")
@@ -291,7 +339,8 @@ def build_model(algo, env, seed, device, verbose):
 
 def train_stage(stage_cfg: StageConfig, env_cls, save_name):
     def _make_env():
-        env = env_cls(dt=stage_cfg.dt, max_time=stage_cfg.max_time)
+        env = env_cls(dt=stage_cfg.dt, max_time=stage_cfg.max_time,
+                      init_scale=stage_cfg.curriculum_init_scale)
         return Monitor(env)
 
     env = make_vec_env(_make_env, n_envs=stage_cfg.n_envs, seed=stage_cfg.seed)
@@ -299,8 +348,9 @@ def train_stage(stage_cfg: StageConfig, env_cls, save_name):
         env = VecNormalize(
             env,
             training=True,
-            norm_obs=False,
+            norm_obs=True,
             norm_reward=True,
+            clip_obs=10.0,
             clip_reward=10.0,
         )
     model = build_model(
@@ -310,14 +360,22 @@ def train_stage(stage_cfg: StageConfig, env_cls, save_name):
         stage_cfg.device,
         stage_cfg.verbose,
     )
-    equilibrium_callback = EquilibriumPrintCallback(
-        stage_name=stage_cfg.name,
-        print_every_episodes=20,
-    )
+    callbacks = CallbackList([
+        CurriculumCallback(
+            init_scale=stage_cfg.curriculum_init_scale,
+            scale_step=stage_cfg.curriculum_scale_step,
+            success_threshold=stage_cfg.curriculum_success_threshold,
+            window=stage_cfg.curriculum_window,
+        ),
+        EquilibriumPrintCallback(
+            stage_name=stage_cfg.name,
+            print_every_episodes=500,
+        ),
+    ])
     model.learn(
         total_timesteps=int(stage_cfg.time_steps),
         log_interval=stage_cfg.log_interval,
-        callback=equilibrium_callback,
+        callback=callbacks,
     )
 
     save_dir = os.path.abspath(
@@ -421,7 +479,7 @@ def main():
     pitch_cfg = StageConfig(
         name="pitch",
         algo=algo,
-        time_steps=1_000_0000 if algo == "ppo" else 500_000_00,
+        time_steps=10_000_000 if algo == "ppo" else 5_000_000,
         n_envs=1,
         seed=seed,
         dt=dt,
@@ -433,7 +491,7 @@ def main():
     position_cfg = StageConfig(
         name="position",
         algo=algo,
-        time_steps=1_000_0000 if algo == "ppo" else 500_000_00,
+        time_steps=10_000_000 if algo == "ppo" else 5_000_000,
         n_envs=1,
         seed=seed + 1,
         dt=dt,
@@ -453,6 +511,7 @@ def main():
         env_cls=PositionStabilizationEnv,
         save_name="quadrotor_position_controller",
     )
+    
 
     two_stage_policy = TwoStageQuadrotorPolicy(
         pitch_model=pitch_model,

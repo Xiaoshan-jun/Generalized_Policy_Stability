@@ -1,0 +1,13 @@
+model_path: nonlinear_system/gym_inverted_pendulum_uncertain/saved_models/sac/sac_pendulum_uncertain_uncertain_d0p5.zip
+algo: sac
+episodes: 20
+steps_per_episode: 300
+disturbance_max: 0.5
+mean_return: -177.732188
+std_return: 107.211048
+best_return: -1.458289
+worst_return: -370.097764
+mean_final_abs_theta: 0.049597
+mean_final_abs_omega: 0.050595
+mean_abs_theta_over_time: 0.240953
+success_rate(|theta|<0.2, |omega|<0.5): 1.000000

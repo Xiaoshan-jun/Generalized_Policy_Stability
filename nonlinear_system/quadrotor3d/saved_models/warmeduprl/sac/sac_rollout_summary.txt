@@ -1,0 +1,8 @@
+rollout_count: 5
+success_rate: 0.0000
+mean_return: -59.150914
+episode 01: reached_equilibrium=False first_reach_step=None return=-55.515350 steps=15
+episode 02: reached_equilibrium=False first_reach_step=None return=-59.540154 steps=15
+episode 03: reached_equilibrium=False first_reach_step=None return=-52.082893 steps=16
+episode 04: reached_equilibrium=False first_reach_step=None return=-60.284996 steps=14
+episode 05: reached_equilibrium=False first_reach_step=None return=-68.331177 steps=14

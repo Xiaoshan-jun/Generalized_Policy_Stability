@@ -1,0 +1,9 @@
+use_local_gains: True
+use_affine_compensation: True
+local_lqr_library_path: /media/jxiang9143/AIDataset/github/Generalized_Policy_Stability/nonlinear_system/quadrotor3d/saved_models/lqr/local_lqr_library.npz
+init_bounds: pos=0.6, angle=0.4, vel=1.5, omega=0.75
+episodes: 100
+mean_return: -11.856453
+std_return: 2.669386
+success_rate: 0.000000
+mean_reach_step: nan

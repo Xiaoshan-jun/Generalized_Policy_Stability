@@ -1,0 +1,10 @@
+algo: ppo
+seed: 0
+reached_equilibrium: False
+first_reach_step: None
+episode_return: -723.387695
+steps: 333
+best_pos_err: 14.589981
+best_angle_err: 1.587940
+best_vel_err: 0.024110
+best_omega_err: 0.049789

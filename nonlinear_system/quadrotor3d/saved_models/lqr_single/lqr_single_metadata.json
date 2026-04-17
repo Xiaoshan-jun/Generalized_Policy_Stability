@@ -1,0 +1,26 @@
+{
+  "mode": "single_gain_hover_linearization_only",
+  "dt": 0.01,
+  "hover_thrust": 1.1477700000000002,
+  "x_eq": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "u_eq": [
+    1.1477700000000002,
+    1.1477700000000002,
+    1.1477700000000002,
+    1.1477700000000002
+  ],
+  "save_dir": "/media/jxiang9143/AIDataset/github/Generalized_Policy_Stability/nonlinear_system/quadrotor3d/saved_models/lqr_single"
+}

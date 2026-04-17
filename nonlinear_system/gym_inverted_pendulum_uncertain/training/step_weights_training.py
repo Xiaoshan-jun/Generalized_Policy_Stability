@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import gymnasium as gym
 from stable_baselines3 import PPO, SAC
 import matplotlib
 
@@ -16,32 +15,35 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from network.PolicyNet import StepNet
 from network.lyapunov_net import LyapunovNet
+from uncertain_env import UncertainDisturbancePendulumEnv
 
 
 class StepNetTrainer:
     def __init__(
         self,
         model_path: str,
-        env_id: str = "Pendulum-v1",
         algo_type: str = "ppo",
         n_steps: int = 20,
         hidden_dim: int = 64,
         n_layers: int = 3,
         alpha: float = 0.05,
         beta: float = 0.01,
+        disturbance_max: float = 0.5,
+        n_rollouts_per_init: int = 3,
     ):
         """
         Initialize trainer for finding Lyapunov function using any RL policy
 
         Args:
             model_path: Path to saved RL model
-            env_id: Gymnasium environment ID
             algo_type: RL algorithm type ('ppo' or 'sac')
             n_steps: Number of future steps to consider
             hidden_dim: Hidden dimension for neural networks
             n_layers: Number of layers for neural networks
             alpha: Decay parameter for stability condition
             beta: Weight parameter for quadratic term in Lyapunov construction
+            disturbance_max: Disturbance torque bound for uncertain env
+            n_rollouts_per_init: Number of stochastic rollouts averaged per initial state
         """
         # Load trained RL model
         self.algo_type = algo_type.lower()
@@ -59,7 +61,11 @@ class StepNetTrainer:
             print(f"Error loading model: {str(e)}")
             raise
 
-        self.env = gym.make(env_id)
+        self.disturbance_max = disturbance_max
+        self.n_rollouts_per_init = max(1, int(n_rollouts_per_init))
+        self.env = UncertainDisturbancePendulumEnv(
+            disturbance_max=self.disturbance_max, g=9.81, m=1.0, l=1.0, b=0.13
+        )
         self.state_dim = self.env.observation_space.shape[0]
 
         # Initialize networks
@@ -84,6 +90,10 @@ class StepNetTrainer:
         # Find practical equilibrium state
         self.equilibrium_state, self.value_at_equilibrium = self.find_practical_equilibrium()
         self.print_equilibrium_info()
+        print(
+            f"Uncertain env config: disturbance_max={self.disturbance_max}, "
+            f"rollouts_per_init={self.n_rollouts_per_init}"
+        )
 
     def get_value(self, obs: np.ndarray) -> float:
         """Get value from RL model based on algorithm type"""
@@ -127,22 +137,22 @@ class StepNetTrainer:
             print(f"State: {self.equilibrium_state}")
         print(f"Value at equilibrium: {self.value_at_equilibrium:.6f}")
 
-    def find_practical_equilibrium(self, simulation_steps: int = 200) -> tuple:
-        """Find practical equilibrium by simulating system"""
-        self.env.reset()
-        if hasattr(self.env.unwrapped, "state"):
-            self.env.unwrapped.state = np.zeros_like(self.env.unwrapped.state)
-        obs, _ = self.env.reset()
-
+    def find_practical_equilibrium(self, simulation_steps: int = 200, n_rollouts: int = 5) -> tuple:
+        """Find practical equilibrium by averaging near-origin simulations in uncertain dynamics."""
         states = []
         values = []
 
-        for _ in range(simulation_steps):
-            states.append(obs)
-            value = self.get_value(obs)
-            action, _ = self.rl_model.predict(obs, deterministic=True)
-            values.append(value)
-            obs, _, _, _, _ = self.env.step(action)
+        for _ in range(max(1, n_rollouts)):
+            self.env.reset()
+            self.env.unwrapped.state = np.array([0.0, 0.0], dtype=np.float64)
+            obs = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+            for _ in range(simulation_steps):
+                states.append(obs)
+                value = self.get_value(obs)
+                action, _ = self.rl_model.predict(obs, deterministic=True)
+                values.append(value)
+                obs, _, _, _, _ = self.env.step(action)
 
         last_n = 10
         equilibrium_state = np.mean(states[-last_n:], axis=0)
@@ -151,54 +161,72 @@ class StepNetTrainer:
         return equilibrium_state, equilibrium_value
 
     def collect_trajectory(self, initial_state, max_steps=200):
-        """Collect trajectory and corresponding values using RL policy (batched RL predictions)"""
+        """
+        Collect stochastic trajectories and average them for uncertain dynamics.
+        """
         theta, omega = initial_state
 
-        # Reset and set state using unwrapped env (correct format)
-        self.env.reset()
-        self.env.unwrapped.state = np.array([theta, omega])
+        rollout_states = []
+        rollout_values = []
 
-        # First observation
-        obs = np.array([np.cos(theta), np.sin(theta), omega])
+        for _ in range(self.n_rollouts_per_init):
+            # Reset and set state using unwrapped env (correct format)
+            self.env.reset()
+            self.env.unwrapped.state = np.array([theta, omega], dtype=np.float64)
 
-        # Collect all states first by stepping through environment
-        states = []
-        actions_list = []
-        
-        for _ in range(max_steps):
-            states.append(obs.copy())
-            
-            # Get action (still need to do this sequentially for stepping)
-            action, _ = self.rl_model.predict(obs, deterministic=True)
-            actions_list.append(action)
-            
-            # Step environment
-            next_obs, _, done, _, _ = self.env.step(action)
-            obs = next_obs
+            # First observation
+            obs = np.array([np.cos(theta), np.sin(theta), omega], dtype=np.float64)
 
-            if done:
-                break
+            # Collect all states first by stepping through environment
+            states = []
+            actions_list = []
 
-        if len(states) == 0:
+            for _ in range(max_steps):
+                states.append(obs.copy())
+
+                # Get action (still need to do this sequentially for stepping)
+                action, _ = self.rl_model.predict(obs, deterministic=True)
+                actions_list.append(action)
+
+                # Step environment (stochastic due to disturbance)
+                next_obs, _, done, _, _ = self.env.step(action)
+                obs = next_obs
+
+                if done:
+                    break
+
+            if len(states) == 0:
+                continue
+
+            # Batch compute all values at once
+            states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
+
+            with torch.no_grad():
+                if self.algo_type == "ppo":
+                    # Batch predict values for all states
+                    values_tensor = self.rl_model.policy.predict_values(states_tensor)
+                    values = np.abs(-values_tensor.cpu().numpy().flatten())
+                else:  # SAC
+                    # For SAC, batch compute Q-values with corresponding actions
+                    actions_tensor = torch.FloatTensor(np.array(actions_list)).to(self.device)
+                    q1, q2 = self.rl_model.critic(states_tensor, actions_tensor)
+                    values_tensor = torch.min(q1, q2)
+                    values = np.abs(-values_tensor.cpu().numpy().flatten())
+
+            rollout_states.append(np.array(states))
+            rollout_values.append(values)
+
+        if len(rollout_states) == 0:
             return np.array([]), np.array([])
 
-        # Batch compute all values at once
-        states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
-        values = []
+        # Use shortest rollout length so all trajectories align
+        min_len = min(states.shape[0] for states in rollout_states)
+        clipped_states = np.stack([states[:min_len] for states in rollout_states], axis=0)
+        clipped_values = np.stack([vals[:min_len] for vals in rollout_values], axis=0)
 
-        with torch.no_grad():
-            if self.algo_type == "ppo":
-                # Batch predict values for all states
-                values_tensor = self.rl_model.policy.predict_values(states_tensor)
-                values = np.abs(-values_tensor.cpu().numpy().flatten())
-            else:  # SAC
-                # For SAC, batch compute Q-values with corresponding actions
-                actions_tensor = torch.FloatTensor(np.array(actions_list)).to(self.device)
-                q1, q2 = self.rl_model.critic(states_tensor, actions_tensor)
-                values_tensor = torch.min(q1, q2)
-                values = np.abs(-values_tensor.cpu().numpy().flatten())
-
-        return np.array(states), np.array(values)
+        mean_states = np.mean(clipped_states, axis=0)
+        mean_values = np.mean(clipped_values, axis=0)
+        return mean_states, mean_values
 
     def get_residual_value(self, state):
         """
@@ -289,10 +317,11 @@ class StepNetTrainer:
         """
         print("\nStarting training with new Lyapunov function construction...")
 
-        # Create directory for saving models if it doesn't exist
-        # Save in the same location as RL models for consistency
+        # Save directly under the uncertain pendulum saved_models directory
         base_dir = os.path.join(os.path.dirname(__file__), "..", "saved_models")
-        save_dir = os.path.join(base_dir, self.algo_type, f"{self.n_steps}steps")
+        disturbance_tag = str(self.disturbance_max).replace(".", "p")
+        run_prefix = f"{self.algo_type}_{self.n_steps}steps_uncertain_d{disturbance_tag}"
+        save_dir = base_dir
         save_dir = os.path.abspath(save_dir)
         os.makedirs(save_dir, exist_ok=True)
         print(f"Models will be saved to: {save_dir}")
@@ -345,8 +374,8 @@ class StepNetTrainer:
                 best_residual_state = self.residual_net.state_dict()
                 print(f"New best model found at epoch {epoch + 1} with loss: {best_loss:.4f}")
 
-                torch.save(best_stepnet_state, f"{save_dir}/stepnet_best.pth")
-                torch.save(best_residual_state, f"{save_dir}/residual_net_best.pth")
+                torch.save(best_stepnet_state, f"{save_dir}/stepnet_{run_prefix}_best.pth")
+                torch.save(best_residual_state, f"{save_dir}/residual_net_{run_prefix}_best.pth")
 
             # Print progress
             if (epoch + 1) % 1 == 0:
@@ -360,8 +389,8 @@ class StepNetTrainer:
         print(f"Best loss achieved: {best_loss:.4f}")
 
         # Save final models
-        torch.save(self.stepnet.state_dict(), f"{save_dir}/stepnet_final.pth")
-        torch.save(self.residual_net.state_dict(), f"{save_dir}/residual_net_final.pth")
+        torch.save(self.stepnet.state_dict(), f"{save_dir}/stepnet_{run_prefix}_final.pth")
+        torch.save(self.residual_net.state_dict(), f"{save_dir}/residual_net_{run_prefix}_final.pth")
 
         # Plot loss
         plt.figure(figsize=(10, 5))
@@ -370,7 +399,7 @@ class StepNetTrainer:
         plt.ylabel("Loss")
         plt.title(f"Training Loss ({self.algo_type}, {self.n_steps} steps)")
         plt.legend()
-        plt.savefig(f"{save_dir}/training_losses.png")
+        plt.savefig(f"{save_dir}/training_losses_{run_prefix}.png")
         plt.close()
 
         return losses, stability_losses, [0] * len(losses)  # Return zeros for positivity losses
@@ -378,10 +407,12 @@ class StepNetTrainer:
 
 def main():
     # Configuration
-    step_sizes = [15]
-    algorithms = ["ppo", "sac"]
+    step_sizes = [1, 5, 10, 15, 20, 25, 30]
+    algorithms = ["sac"]
     n_epochs = 1000
     batch_size = 512
+    disturbance_max = 0.5
+    n_rollouts_per_init = 3
 
     for algo in algorithms:
         print(f"\n{'=' * 50}")
@@ -394,13 +425,28 @@ def main():
             print(f"{'-' * 30}")
 
             try:
+                rl_model_paths = {
+                    "sac": os.path.join(
+                        os.path.dirname(__file__),
+                        "..",
+                        "saved_models",
+                        "sac",
+                        "sac_pendulum_uncertain_uncertain_d0p5.zip",
+                    ),
+                }
+                model_path = rl_model_paths.get(algo)
+                if model_path is None:
+                    raise ValueError(f"No RL model path configured for algo={algo}")
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"RL model file not found: {model_path}")
+
                 # Initialize trainer
                 trainer = StepNetTrainer(
-                    model_path=os.path.join(
-                        os.path.dirname(__file__), "..", "saved_models", algo, "pendulum"
-                    ),
+                    model_path=model_path,
                     algo_type=algo,
                     n_steps=n_steps,
+                    disturbance_max=disturbance_max,
+                    n_rollouts_per_init=n_rollouts_per_init,
                 )
 
                 # Train networks

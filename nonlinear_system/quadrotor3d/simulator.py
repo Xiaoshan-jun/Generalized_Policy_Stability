@@ -16,14 +16,14 @@ Usage
 -----
     # Single checkpoint
     python simulate_quadrotor.py \
-        --rl_model_path  saved_models/ppo/quadrotor3d_model \
+        --rl_model_path  nonlinear_system/quadrotor3d/saved_models/ppo/quadrotor3d_model.zip \
         --stepnet_path   saved_models/ppo/15steps_quadrotor3d/stepnet_best.pth \
         --residual_path  saved_models/ppo/15steps_quadrotor3d/residual_net_best.pth \
         --algo ppo --n_steps 15 --n_episodes 5 --out_dir results/
 
     # Compare multiple n_steps checkpoints  (mirrors the training loop in main())
     python simulate_quadrotor.py \
-        --rl_model_path saved_models/ppo/quadrotor3d_model \
+        --rl_model_path nonlinear_system/quadrotor3d/saved_models/ppo/quadrotor3d_model.zip \
         --compare_nsteps 5 10 15 20 \
         --compare_dir    saved_models/ppo \
         --algo ppo --n_episodes 3 --out_dir results/compare/
@@ -391,6 +391,7 @@ def plot_nsteps_comparison(results: dict, save_path=None):
 
 def load_rl(model_path, algo):
     assert _HAS_SB3, "stable-baselines3 required."
+    model_path = _resolve_existing_path(model_path)
     cls = PPO if algo.lower() == "ppo" else SAC
     m = cls.load(model_path)
     print(f"Loaded {algo.upper()} from  {model_path}")
@@ -441,6 +442,33 @@ def run_batch(env, rl_model, lyap, cfg, n_steps, out_dir):
 
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _SAVED_ROOT = os.path.join(_HERE, "saved_models")
+_REPO_ROOT  = os.path.abspath(os.path.join(_HERE, "..", ".."))
+
+
+def _resolve_existing_path(path: str) -> str:
+    """Resolve files robustly for both repo-root and subdir execution."""
+    candidates = [
+        path,
+        os.path.join(_HERE, path),
+        os.path.join(_REPO_ROOT, path),
+    ]
+    expanded = []
+    for c in candidates:
+        expanded.append(c)
+        if c.endswith(".zip"):
+            expanded.append(c[:-4])
+        else:
+            expanded.append(c + ".zip")
+
+    checked = set()
+    for c in expanded:
+        full = os.path.abspath(c)
+        if full in checked:
+            continue
+        checked.add(full)
+        if os.path.exists(full):
+            return full
+    return os.path.abspath(path)
 
 
 def _default_paths(algo: str, n_steps: int):
@@ -461,8 +489,11 @@ def build_parser():
     p.add_argument("--algo",    default="ppo", choices=["ppo", "sac"])
     p.add_argument("--n_steps", type=int, default=15)
     # paths -- default to StepNetTrainer3D save structure; override if needed
-    p.add_argument("--rl_model_path", default=None,
-                   help="Default: saved_models/<algo>/quadrotor3d_model")
+    p.add_argument(
+        "--rl_model_path",
+        default="nonlinear_system/quadrotor3d/saved_models/ppo/quadrotor3d_model.zip",
+        help="Path to RL model checkpoint; auto-resolves .zip/no-.zip and relative paths",
+    )
     p.add_argument("--stepnet_path",  default=None,
                    help="Default: saved_models/<algo>/<n_steps>steps_quadrotor3d/stepnet_best.pth")
     p.add_argument("--residual_path", default=None,
