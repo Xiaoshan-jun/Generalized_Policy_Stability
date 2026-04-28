@@ -5,7 +5,7 @@ import torch
 
 # Import your dynamics class (the "Quadrotor" class you pasted)
 # If it's in a file like quadrotor_3d.py, change the import accordingly.
-from quadrotor3d import Quadrotor # <-- CHANGE ME to your module name
+from quadrotor3d import Quadrotor #
 
 
 def wrap_to_pi(angle: float) -> float:
@@ -167,7 +167,7 @@ class Quadrotor3DEnv(gym.Env):
         # Termination/truncation
         terminated = False
         terminated = (
-                (x_next[2] < -0.1) or
+                (x_next[2] < -5) or
                 (abs(x_next[3]) > 1.2) or
                 (abs(x_next[4]) > 1.2) or
                 (abs(x_next[0]) > 5.0) or (abs(x_next[1]) > 5.0) or
