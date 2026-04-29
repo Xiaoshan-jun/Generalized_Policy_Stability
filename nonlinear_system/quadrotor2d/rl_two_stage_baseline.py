@@ -39,6 +39,7 @@ class StageConfig:
     verbose: int = 0
     log_interval: int = 10
     normalize_reward: bool = True
+    resume_path: str = ""   # path to a saved model zip (without .zip) to resume from
 
 
 class PitchStabilizationEnv(Quadrotor2DEnv):
@@ -102,9 +103,18 @@ class PitchStabilizationEnv(Quadrotor2DEnv):
     def reached_equilibrium(self, pitch_obs) -> bool:
         # pitch_obs is [theta, theta_dot]
         pitch_obs = np.asarray(pitch_obs, dtype=np.float32)
+        if not (abs(float(pitch_obs[0])) < np.pi * 0.1
+                and abs(float(pitch_obs[1])) < 0.9):
+            return False
+        # x, z, vx, vz must also lie within the easy position stage reset range
+        # so the handoff starts from a state the position controller can handle.
+        x_lim, z_lim, vx_lim, vz_lim, _ = _POSITION_CURRICULUM[-1]
+        full = self.x_current.detach().cpu().numpy()
         return bool(
-            abs(float(pitch_obs[0])) < np.pi * 0.3
-            and abs(float(pitch_obs[1])) < 0.9
+            abs(float(full[0])) <= x_lim
+            and abs(float(full[1])) <= z_lim
+            and abs(float(full[3])) <= vx_lim
+            and abs(float(full[4])) <= vz_lim
         )
 
     def step(self, action):
@@ -115,7 +125,7 @@ class PitchStabilizationEnv(Quadrotor2DEnv):
         theta_dot = state[5]
         z         = state[1]
 
-        crashed   = float(z) < -5.0
+        crashed   = float(z) < -10.0
         pitch_obs = self._pitch_obs(full_obs)
         success   = self.reached_equilibrium(pitch_obs)
 
@@ -146,32 +156,37 @@ class PitchStabilizationEnv(Quadrotor2DEnv):
         return pitch_obs, float(reward), terminated, truncated, info
 
 
+# Curriculum stages for position training: (x_lim, z_lim, vx_lim, vz_lim, label)
+# theta/theta_dot reset range is always ±small_angle_limit / ±0.9 (pitch already small at handoff).
+_POSITION_CURRICULUM = [
+    (0.5,  0.5,  1.0,  1.0,  "easy"),
+    (1.5,  1.5,  2.5,  2.5,  "medium"),
+    (3.0,  3.0,  4.0,  4.0,  "full"),
+]
+
+
 class PositionStabilizationEnv(Quadrotor2DEnv):
-    def __init__(self, dt=0.01, max_time=2.0, small_angle_limit=0.3*np.pi):
+    def __init__(self, dt=0.01, max_time=2.0, small_angle_limit=0.1*np.pi,
+                 curriculum_level=0):
         super().__init__(dt=dt, max_time=max_time)
         self.small_angle_limit = float(small_angle_limit)
+        self.curriculum_level = int(curriculum_level)
+        self._update_reset_bounds()
+
+    def _update_reset_bounds(self):
+        x, z, vx, vz, _ = _POSITION_CURRICULUM[self.curriculum_level]
         self.reset_x_lo = torch.tensor(
-            [
-                float(-4),
-                float(-4),
-                -self.small_angle_limit,
-                float(-10),
-                float(-10),
-                -0.9,
-            ],
+            [-x, -z, -self.small_angle_limit, -vx, -vz, -0.9],
             dtype=self.dtype,
         )
         self.reset_x_up = torch.tensor(
-            [
-                float(4),
-                float(4),
-                self.small_angle_limit,
-                float(10),
-                float(10),
-                0.9,
-            ],
+            [ x,  z,  self.small_angle_limit,  vx,  vz,  0.9],
             dtype=self.dtype,
         )
+
+    def set_curriculum_level(self, level: int):
+        self.curriculum_level = min(int(level), len(_POSITION_CURRICULUM) - 1)
+        self._update_reset_bounds()
 
     def reset(self, *, seed=None, options=None):
         # Skip Quadrotor2DEnv.reset() to avoid consuming 6 random numbers for
@@ -213,28 +228,28 @@ class PositionStabilizationEnv(Quadrotor2DEnv):
         vz = state[4]
         theta_dot = state[5]
 
-        crashed = float(z) < -5.0
+        crashed = float(z) < -10.0
         success = self.reached_equilibrium(obs)
 
         reward = -(
-            20.0 * x.pow(2).item()
-            + 30.0 * z.pow(2).item()
-            + 4.0 * vx.pow(2).item()
+            5.0 * x.pow(2).item()
+            + 5.0 * z.pow(2).item()
+            + 5.0 * vx.pow(2).item()
             + 5.0 * vz.pow(2).item()
-            + 8.0 * theta.pow(2).item()
-            + 2.0 * theta_dot.pow(2).item()
-            + 0.1 * act_delta.pow(2).sum().item()
+            + 10.0 * theta.pow(2).item()
+            + 5.0 * theta_dot.pow(2).item()
+            + 5.0 * act_delta.pow(2).sum().item()
         )
         terminated = bool(
             success or crashed or terminated or torch.abs(theta).item() > self.small_angle_limit * 2.0
         )
 
         if crashed:
-            reward -= 200.0
+            reward -= 2000.0
         if success:
-            reward += 500.0
+            reward += 5000.0
         elif terminated or truncated:
-            reward -= 100.0
+            reward -= 2000.0
 
         info["reached_equilibrium"] = success
         info["stage_name"] = "position"
@@ -377,6 +392,132 @@ class EquilibriumPrintCallback(BaseCallback):
         return True
 
 
+class CurriculumCallback(BaseCallback):
+    """
+    Curriculum learning for position training.
+
+    Periodically evaluates the deterministic policy at the current curriculum
+    level.  When success rate exceeds ``success_threshold`` the reset range
+    expands to the next level.  Training stops automatically once the policy
+    clears the threshold at the final (full-range) level.
+    """
+
+    def __init__(
+        self,
+        stage_name: str,
+        make_eval_env,                  # callable(level: int) -> env
+        success_threshold: float = 0.85,
+        eval_every_episodes: int = 5_000,
+        eval_num_episodes: int = 100,
+        print_every_episodes: int = 500,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.stage_name = stage_name
+        self.make_eval_env = make_eval_env
+        self.success_threshold = success_threshold
+        self.eval_every_episodes = eval_every_episodes
+        self.eval_num_episodes = eval_num_episodes
+        self.print_every_episodes = print_every_episodes
+
+        self.episode_count = 0
+        self.episode_rewards: list = []
+        self.episode_successes: list = []
+        self.current_level = 0
+        self.max_level = len(_POSITION_CURRICULUM) - 1
+        self.should_stop = False
+
+    # ── curriculum helpers ────────────────────────────────────────────────────
+
+    def _advance(self):
+        self.current_level += 1
+        # propagates through VecNormalize → DummyVecEnv → Monitor → env
+        self.training_env.env_method("set_curriculum_level", self.current_level)
+        x, z, vx, vz, label = _POSITION_CURRICULUM[self.current_level]
+        print(
+            f"[{self.stage_name}] *** curriculum → level {self.current_level} "
+            f"({label}): x,z ±{x:.1f}  vx,vz ±{vx:.1f} ***"
+        )
+
+    def _run_eval(self):
+        eval_env = self.make_eval_env(self.current_level)
+        total_success = 0
+        total_reward = 0.0
+
+        for ep in range(self.eval_num_episodes):
+            obs, _ = eval_env.reset(seed=100_000 + ep)
+            ep_reward = 0.0
+            while True:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                ep_reward += float(reward)
+                if terminated or truncated:
+                    total_success += int(info.get("reached_equilibrium", False))
+                    total_reward += ep_reward
+                    break
+
+        sr = total_success / self.eval_num_episodes
+        avg_r = total_reward / self.eval_num_episodes
+        label = _POSITION_CURRICULUM[self.current_level][4]
+        print(
+            f"[{self.stage_name}] eval @ level {self.current_level} ({label}): "
+            f"success={sr:.2%}  avg_reward={avg_r:.1f}"
+        )
+
+        if sr >= self.success_threshold:
+            if self.current_level < self.max_level:
+                self._advance()
+            else:
+                print(
+                    f"[{self.stage_name}] full-range success {sr:.2%} "
+                    f">= {self.success_threshold:.0%} — stopping."
+                )
+                self.should_stop = True
+
+    # ── SB3 callback interface ────────────────────────────────────────────────
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+        if dones is None:
+            dones = []
+
+        for idx, info in enumerate(infos):
+            if not (bool(dones[idx]) if idx < len(dones) else False):
+                continue
+
+            self.episode_count += 1
+            if isinstance(info.get("episode"), dict):
+                r = info["episode"].get("r")
+                if r is not None:
+                    self.episode_rewards.append(float(r))
+
+            self.episode_successes.append(
+                1 if info.get("reached_equilibrium", False) else 0
+            )
+
+            if (self.print_every_episodes > 0
+                    and self.episode_count % self.print_every_episodes == 0
+                    and self.episode_rewards):
+                w = self.episode_rewards[-self.print_every_episodes:]
+                sr_w = self.episode_successes[-100:]
+                label = _POSITION_CURRICULUM[self.current_level][4]
+                print(
+                    f"[{self.stage_name}] ep {self.episode_count} "
+                    f"(level={self.current_level} {label}): "
+                    f"avg_r={sum(w)/len(w):.1f}  "
+                    f"sr={sum(sr_w)/len(sr_w):.2%}"
+                )
+
+            if (self.eval_every_episodes > 0
+                    and self.episode_count % self.eval_every_episodes == 0):
+                self._run_eval()
+                if self.should_stop:
+                    return False
+
+        return True
+
+
 def resolve_device(device: str) -> str:
     device = device.lower().strip()
     if device == "auto":
@@ -422,7 +563,7 @@ def build_model(algo, env, seed, device, verbose):
     raise ValueError("algo must be 'ppo' or 'sac'")
 
 
-def train_stage(stage_cfg: StageConfig, env_cls, save_name):
+def train_stage(stage_cfg: StageConfig, env_cls, save_name, callback=None):
     def _make_env():
         env = env_cls(dt=stage_cfg.dt, max_time=stage_cfg.max_time)
         return Monitor(env)
@@ -439,24 +580,35 @@ def train_stage(stage_cfg: StageConfig, env_cls, save_name):
             norm_reward=True,
             clip_reward=10.0,
         )
-    model = build_model(
-        stage_cfg.algo,
-        env,
-        stage_cfg.seed,
-        stage_cfg.device,
-        stage_cfg.verbose,
-    )
-    equilibrium_callback = EquilibriumPrintCallback(
-        stage_name=stage_cfg.name,
-        eval_env_fn=_make_eval_env,
-        eval_every_episodes=10_000,
-        eval_num_episodes=100,
-        print_every_episodes=100,
-    )
+    if stage_cfg.resume_path and os.path.exists(stage_cfg.resume_path + ".zip"):
+        algo_cls = SAC if stage_cfg.algo == "sac" else PPO
+        print(f"[{stage_cfg.name}] Resuming from: {stage_cfg.resume_path}.zip")
+        model = algo_cls.load(
+            stage_cfg.resume_path,
+            env=env,
+            device=resolve_device(stage_cfg.device),
+        )
+    else:
+        model = build_model(
+            stage_cfg.algo,
+            env,
+            stage_cfg.seed,
+            stage_cfg.device,
+            stage_cfg.verbose,
+        )
+    if callback is None:
+        callback = EquilibriumPrintCallback(
+            stage_name=stage_cfg.name,
+            eval_env_fn=_make_eval_env,
+            eval_every_episodes=10_000,
+            eval_num_episodes=100,
+            print_every_episodes=100,
+        )
     model.learn(
         total_timesteps=int(stage_cfg.time_steps),
         log_interval=stage_cfg.log_interval,
-        callback=equilibrium_callback,
+        callback=callback,
+        reset_num_timesteps=not bool(stage_cfg.resume_path),
     )
 
     save_dir = os.path.abspath(
@@ -582,25 +734,40 @@ def main():
         log_interval=log_interval,
     )
 
-    train_pitch = False
-    if train_pitch:
-        pitch_model, _ = train_stage(
-            stage_cfg=pitch_cfg,
-            env_cls=PitchStabilizationEnv,
-            save_name="quadrotor_pitch_controller",
-        )
-    else:
-        algo_cls = SAC if algo == "sac" else PPO
-        pitch_model_path = os.path.join(
-            os.path.dirname(__file__), "saved_models", algo, "two_stage",
-            "quadrotor_pitch_controller",
-        )
-        print(f"Loading pitch model from: {pitch_model_path}.zip")
-        pitch_model = algo_cls.load(pitch_model_path)
+    _pitch_ckpt = os.path.join(
+        os.path.dirname(__file__), "saved_models", algo, "two_stage",
+        "quadrotor_pitch_controller1",
+    )
+    pitch_cfg.resume_path = _pitch_ckpt   # ignored by train_stage if .zip absent
+    pitch_model, _ = train_stage(
+        stage_cfg=pitch_cfg,
+        env_cls=PitchStabilizationEnv,
+        save_name="quadrotor_pitch_controller",
+    )
+
+    _pos_ckpt = os.path.join(
+        os.path.dirname(__file__), "saved_models", algo, "two_stage",
+        "quadrotor_position_controller",
+    )
+    position_cfg.resume_path = _pos_ckpt   # ignored by train_stage if .zip absent
+
+    def _make_pos_eval_env(level=0):
+        return PositionStabilizationEnv(dt=dt, max_time=max_time,
+                                        curriculum_level=level)
+
+    curriculum_cb = CurriculumCallback(
+        stage_name="position",
+        make_eval_env=_make_pos_eval_env,
+        success_threshold=0.85,
+        eval_every_episodes=5_000,
+        eval_num_episodes=100,
+        print_every_episodes=500,
+    )
     position_model, _ = train_stage(
         stage_cfg=position_cfg,
         env_cls=PositionStabilizationEnv,
         save_name="quadrotor_position_controller",
+        callback=curriculum_cb,
     )
 
     two_stage_policy = TwoStageQuadrotorPolicy(
