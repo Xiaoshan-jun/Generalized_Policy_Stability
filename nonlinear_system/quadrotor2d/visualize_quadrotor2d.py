@@ -35,15 +35,57 @@ from quadrotor2d_env import Quadrotor2DEnv  # noqa: E402
 # Value-function query
 # ─────────────────────────────────────────────────────────────────────────────
 
+_PITCH_OBS_INDICES = [2, 5]  # theta, theta_dot indices in the 6D state vector
+
+
+def _adapt_obs(model, obs: np.ndarray) -> np.ndarray:
+    """Slice obs to match the model's expected input dimension if needed."""
+    model_dim = model.observation_space.shape[0]
+    if model_dim == 2 and obs.shape[0] == 6:
+        return obs[_PITCH_OBS_INDICES]
+    return obs
+
+
+class TwoStagePolicy:
+    """
+    Dispatches to the pitch or position sub-model based on |theta|.
+
+    Mirrors TwoStageQuadrotorPolicy from rl_two_stage_baseline but kept
+    local so the visualizer has no training-code dependency.
+    """
+
+    def __init__(self, pitch_model, position_model, theta_threshold: float = 0.08):
+        self.pitch_model    = pitch_model
+        self.position_model = position_model
+        self.theta_threshold = theta_threshold
+        # Expose the 6-D obs-space so _adapt_obs leaves observations intact.
+        self.observation_space = position_model.observation_space
+        self.device = position_model.device
+
+    def _active(self, obs: np.ndarray):
+        return (self.pitch_model
+                if abs(float(obs[2])) > self.theta_threshold
+                else self.position_model)
+
+    def predict(self, obs: np.ndarray, deterministic: bool = True):
+        active = self._active(obs)
+        return active.predict(_adapt_obs(active, obs), deterministic=deterministic)
+
+
 def get_value(model, obs: np.ndarray) -> float:
     """
     Query the model's value estimate V(s) for a single observation.
 
-    - PPO  : reads the value head directly.
-    - SAC  : approximates V(s) ≈ min Q(s, π(s)) using the deterministic actor.
+    - SAC          : approximates V(s) ≈ min Q(s, π(s)) via the deterministic actor.
+    - PPO          : reads the value head directly.
+    - TwoStagePolicy: delegates to whichever sub-model is currently active.
     """
     from stable_baselines3 import SAC
 
+    if isinstance(model, TwoStagePolicy):
+        return get_value(model._active(obs), obs)
+
+    obs = _adapt_obs(model, obs)
     obs_t = torch.FloatTensor(obs).unsqueeze(0).to(model.device)
     with torch.no_grad():
         if isinstance(model, SAC):
@@ -73,7 +115,8 @@ def rollout(model, env: Quadrotor2DEnv, seed: int = 0):
     states, actions, values = [obs.copy()], [], [get_value(model, obs)]
 
     while True:
-        action, _ = model.predict(obs, deterministic=True)
+        policy_obs = _adapt_obs(model, obs)
+        action, _ = model.predict(policy_obs, deterministic=True)
         action = np.asarray(action, dtype=np.float32)
         obs, _, terminated, truncated, _ = env.step(action)
         states.append(obs.copy())
@@ -303,32 +346,63 @@ def animate(states: np.ndarray, actions: np.ndarray, dt: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
     from stable_baselines3 import SAC, PPO
 
-    here = os.path.dirname(__file__)
+    parser = argparse.ArgumentParser(
+        description="Visualize a trained quadrotor 2-D controller."
+    )
+    parser.add_argument(
+        "--controller",
+        choices=["pitch", "position", "two_stage"],
+        default="two_stage",
+        help="Which controller to visualize (default: two_stage)",
+    )
+    parser.add_argument(
+        "--algo",
+        choices=["sac", "ppo"],
+        default="sac",
+        help="RL algorithm whose saved model to load (default: sac)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for the rollout initial state (default: 42)",
+    )
+    args = parser.parse_args()
 
-    for algo_cls, algo_name in [(SAC, "sac"), (PPO, "ppo")]:
-        model_path = os.path.join(
-            here, "saved_models", algo_name, "two_stage",
-            "quadrotor_pitch_controller.zip",
+    here      = os.path.dirname(__file__)
+    algo_cls  = SAC if args.algo == "sac" else PPO
+    model_dir = os.path.join(here, "saved_models", args.algo, "two_stage")
+
+    def _load(name):
+        path = os.path.join(model_dir, f"{name}.zip")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Model not found: {path}\n"
+                "Train first with rl_two_stage_baseline.py."
+            )
+        print(f"Loading {algo_cls.__name__} model from: {path}")
+        return algo_cls.load(path)
+
+    if args.controller == "pitch":
+        model = _load("quadrotor_pitch_controller")
+        title = f"Quadrotor 2-D — Pitch Controller ({args.algo.upper()})"
+    elif args.controller == "position":
+        model = _load("quadrotor_position_controller")
+        title = f"Quadrotor 2-D — Position Controller ({args.algo.upper()})"
+    else:  # two_stage
+        model = TwoStagePolicy(
+            pitch_model=_load("quadrotor_pitch_controller"),
+            position_model=_load("quadrotor_position_controller"),
         )
-        if os.path.exists(model_path):
-            print(f"Loading {algo_name.upper()} model from: {model_path}")
-            model = algo_cls.load(model_path)
-            break
-    else:
-        raise FileNotFoundError(
-            "No saved model found. Train first with rl_two_stage_baseline.py."
-        )
+        title = f"Quadrotor 2-D — Two-Stage Controller ({args.algo.upper()})"
 
     env = Quadrotor2DEnv(dt=0.01, max_time=4.0)
-
     print("Running rollout …")
-    states, actions, values, dt = rollout(model, env, seed=42)
+    states, actions, values, dt = rollout(model, env, seed=args.seed)
     print(f"Episode length: {len(states)} steps  ({len(states) * dt:.2f} s)")
 
-    animate(states, actions, dt, values=values,
-            title=f"Quadrotor 2-D — Pitch Controller ({algo_name.upper()})")
+    animate(states, actions, dt, values=values, title=title)
 
 
 if __name__ == "__main__":

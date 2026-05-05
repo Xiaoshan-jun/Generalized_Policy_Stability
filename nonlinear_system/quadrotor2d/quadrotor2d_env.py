@@ -91,6 +91,7 @@ class Quadrotor2DEnv(gym.Env):
 
         # next state via dynamics
         x_next_np = self.system.next_pose(self.x_current, action_t, self.dt)
+        x_next_np[2] = (x_next_np[2] + np.pi) % (2 * np.pi) - np.pi  # wrap theta to [-π, π]
         x_next = torch.as_tensor(x_next_np, dtype=self.dtype)
 
         # reward (negative quadratic cost about equilibrium)
