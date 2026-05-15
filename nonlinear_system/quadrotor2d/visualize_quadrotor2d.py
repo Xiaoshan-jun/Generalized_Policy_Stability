@@ -50,26 +50,102 @@ class TwoStagePolicy:
     """
     Dispatches to the pitch or position sub-model based on |theta|.
 
-    Mirrors TwoStageQuadrotorPolicy from rl_two_stage_baseline but kept
-    local so the visualizer has no training-code dependency.
+    Position phase uses a moving reference point: starting from the position at
+    handoff, a waypoint one `ref_step` closer to origin is fed to the controller.
+    Each time the drone gets within `ref_reach_threshold` of the waypoint, the
+    waypoint advances another `ref_step` toward origin, until it reaches (0, 0).
     """
 
-    def __init__(self, pitch_model, position_model, theta_threshold: float = 0.08):
+    def __init__(self, pitch_model, position_model,
+                 theta_threshold: float = 0.1 * np.pi,
+                 ref_step: float = 1.0,
+                 ref_reach_threshold: float = 0.3):
         self.pitch_model    = pitch_model
         self.position_model = position_model
         self.theta_threshold = theta_threshold
+        self.ref_step = float(ref_step)
+        self.ref_reach_threshold = float(ref_reach_threshold)
         # Expose the 6-D obs-space so _adapt_obs leaves observations intact.
         self.observation_space = position_model.observation_space
         self.device = position_model.device
+        # Reference waypoint state (set on first switch into position mode).
+        self.x_ref = 0.0
+        self.z_ref = 0.0
+        self.ref_initialized = False
+        # Once we hand off to the position controller we never switch back,
+        # even if |theta| later exceeds the threshold.
+        self.position_latched = False
+
+    def reset_episode_state(self) -> None:
+        self.x_ref = 0.0
+        self.z_ref = 0.0
+        self.ref_initialized = False
+        self.position_latched = False
 
     def _active(self, obs: np.ndarray):
+        if self.position_latched:
+            return self.position_model
         return (self.pitch_model
                 if abs(float(obs[2])) > self.theta_threshold
                 else self.position_model)
 
+    def current_mode(self, obs: np.ndarray) -> str:
+        if self.position_latched:
+            return "position"
+        return "pitch" if abs(float(obs[2])) > self.theta_threshold else "position"
+
+    def current_reference(self):
+        if not self.ref_initialized:
+            return None
+        return (float(self.x_ref), float(self.z_ref))
+
+    @staticmethod
+    def _step_toward_zero(v: float, step: float) -> float:
+        if v > 0:
+            return max(0.0, v - step)
+        if v < 0:
+            return min(0.0, v + step)
+        return 0.0
+
+    def _update_reference(self, x: float, z: float) -> None:
+        if not self.ref_initialized:
+            self.x_ref = self._step_toward_zero(x, self.ref_step)
+            self.z_ref = self._step_toward_zero(z, self.ref_step)
+            self.ref_initialized = True
+            return
+        reached = (abs(x - self.x_ref) < self.ref_reach_threshold
+                   and abs(z - self.z_ref) < self.ref_reach_threshold)
+        at_origin = abs(self.x_ref) < 1e-3 and abs(self.z_ref) < 1e-3
+        if reached and not at_origin:
+            self.x_ref = self._step_toward_zero(self.x_ref, self.ref_step)
+            self.z_ref = self._step_toward_zero(self.z_ref, self.ref_step)
+
+    def _shifted_position_obs(self, obs: np.ndarray) -> np.ndarray:
+        shifted = obs.copy()
+        shifted[0] = obs[0] - self.x_ref
+        shifted[1] = obs[1] - self.z_ref
+        return shifted
+
+    def position_query_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Return the (possibly shifted) obs that the position policy should see.
+
+        Caller must guarantee we're in position mode and the reference has
+        already been updated this step.
+        """
+        return self._shifted_position_obs(np.asarray(obs, dtype=np.float32))
+
     def predict(self, obs: np.ndarray, deterministic: bool = True):
-        active = self._active(obs)
-        return active.predict(_adapt_obs(active, obs), deterministic=deterministic)
+        obs = np.asarray(obs, dtype=np.float32)
+        if not self.position_latched and abs(float(obs[2])) > self.theta_threshold:
+            return self.pitch_model.predict(
+                obs[_PITCH_OBS_INDICES], deterministic=deterministic
+            )
+        # First time we get here this episode, latch into position mode.
+        self.position_latched = True
+        self._update_reference(float(obs[0]), float(obs[1]))
+        return self.position_model.predict(
+            self._shifted_position_obs(obs), deterministic=deterministic
+        )
 
 
 def get_value(model, obs: np.ndarray) -> float:
@@ -83,7 +159,11 @@ def get_value(model, obs: np.ndarray) -> float:
     from stable_baselines3 import SAC
 
     if isinstance(model, TwoStagePolicy):
-        return get_value(model._active(obs), obs)
+        active = model._active(obs)
+        query_obs = (model.position_query_obs(obs)
+                     if active is model.position_model
+                     else obs)
+        return get_value(active, query_obs)
 
     obs = _adapt_obs(model, obs)
     obs_t = torch.FloatTensor(obs).unsqueeze(0).to(model.device)
@@ -100,36 +180,79 @@ def get_value(model, obs: np.ndarray) -> float:
 # Rollout helper
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _classify_controller(model, obs: np.ndarray) -> str:
+    """Return 'pitch' / 'position' / 'single' for the active controller this step."""
+    if isinstance(model, TwoStagePolicy):
+        return model.current_mode(obs)
+    if model.observation_space.shape[0] == 2:
+        return "pitch"
+    return "position"
+
+
+def _reached_equilibrium(obs: np.ndarray) -> bool:
+    """Mirror of PositionStabilizationEnv.reached_equilibrium."""
+    return bool(
+        abs(float(obs[0])) < 0.05
+        and abs(float(obs[1])) < 0.05
+        and abs(float(obs[2])) < 0.03
+        and abs(float(obs[3])) < 0.12
+        and abs(float(obs[4])) < 0.12
+        and abs(float(obs[5])) < 0.10
+    )
+
+
 def rollout(model, env: Quadrotor2DEnv, seed: int = 0):
     """
     Run one episode and return arrays of states, actions, and value estimates.
 
     Returns
     -------
-    states  : (T, 6)  [x, z, theta, vx, vz, theta_dot]
-    actions : (T, 2)  [u_left, u_right]
-    values  : (T,)    V(s) at each state
-    dt      : float
+    states     : (T, 6)  [x, z, theta, vx, vz, theta_dot]
+    actions    : (T, 2)  [u_left, u_right]
+    values     : (T,)    V(s) at each state
+    dt         : float
+    modes      : list[str]   active controller name per step
+    references : list[(x_ref, z_ref) or None]  reference waypoint per step
+                 (only populated for TwoStagePolicy in position mode)
     """
+    if isinstance(model, TwoStagePolicy):
+        model.reset_episode_state()
     obs, _ = env.reset(seed=seed)
+
+    # Bias the initial pitch to be large so the pitch stage has visible work
+    # to do before handing off to the position controller. Sign and magnitude
+    # are drawn from a seed-derived RNG so rollouts stay reproducible.
+    _rng = np.random.RandomState(seed)
+    _sign = 1.0 if _rng.random() > 0.5 else -1.0
+    _initial_theta = _sign * _rng.uniform(np.pi / 4, np.pi / 2)   # 45°–90°
+    env.x_current[2] = float(_initial_theta)
+    obs = env.x_current.detach().cpu().numpy().astype(np.float32).copy()
+
     states, actions, values = [obs.copy()], [], [get_value(model, obs)]
+    modes, references = [], []
 
     while True:
+        mode = _classify_controller(model, obs)
         policy_obs = _adapt_obs(model, obs)
         action, _ = model.predict(policy_obs, deterministic=True)
         action = np.asarray(action, dtype=np.float32)
+        ref = (model.current_reference()
+               if (isinstance(model, TwoStagePolicy) and mode == "position")
+               else None)
+        modes.append(mode)
+        references.append(ref)
         obs, _, terminated, truncated, _ = env.step(action)
         states.append(obs.copy())
         actions.append(action.copy())
         values.append(get_value(model, obs))
-        if terminated or truncated:
+        if terminated or truncated or _reached_equilibrium(obs):
             break
 
     # Align: drop the last state so index i = state after action i.
     states  = np.asarray(states[:-1],  dtype=np.float32)  # (T, 6)
     actions = np.asarray(actions,       dtype=np.float32)  # (T, 2)
     values  = np.asarray(values[:-1],   dtype=np.float32)  # (T,)
-    return states, actions, values, env.dt
+    return states, actions, values, env.dt, modes, references
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,6 +313,8 @@ def _update_drone(artists, cx, cz, theta, u_left, u_right,
 
 def animate(states: np.ndarray, actions: np.ndarray, dt: float,
             values: np.ndarray = None,
+            modes: list = None,
+            references: list = None,
             title: str = "Quadrotor 2-D Controller",
             trail_len: int = 40,
             interval_ms: int = 30,
@@ -249,6 +374,13 @@ def animate(states: np.ndarray, actions: np.ndarray, dt: float,
     ax_drone.legend(fontsize=8, loc="upper right")
 
     drone_artists = _make_drone_artists(ax_drone)
+
+    # Marker for the active position-stage reference waypoint.
+    ref_marker, = ax_drone.plot(
+        [], [], marker="x", ms=10, mew=2, color="crimson",
+        linestyle="None", zorder=7, label="reference",
+    )
+    ax_drone.legend(fontsize=8, loc="upper right")
 
     info_text = ax_drone.text(
         0.02, 0.97, "", transform=ax_drone.transAxes,
@@ -310,19 +442,28 @@ def animate(states: np.ndarray, actions: np.ndarray, dt: float,
         )
 
         val_str = f"\nV(s) = {values[i]:+.1f}" if values is not None else ""
+        mode_str = f"\ncontroller: {modes[i]}" if modes is not None else ""
+        ref_str = ""
+        if references is not None and references[i] is not None:
+            xr, zr = references[i]
+            ref_str = f"\nref = ({xr:+.2f}, {zr:+.2f})"
+            ref_marker.set_data([xr], [zr])
+        else:
+            ref_marker.set_data([], [])
+
         info_text.set_text(
             f"t = {time[i]:.2f} s\n"
             f"x = {x_pos[i]:+.3f} m\n"
             f"z = {z_pos[i]:+.3f} m\n"
             f"θ = {np.degrees(theta[i]):+.1f}°\n"
             f"θ̇ = {th_dot[i]:+.3f} rad/s"
-            + val_str
+            + mode_str + ref_str + val_str
         )
 
         for cursor in cursors:
             cursor.set_xdata([time[i], time[i]])
 
-        artists_out = (*drone_artists, info_text, *cursors)
+        artists_out = (*drone_artists, info_text, ref_marker, *cursors)
         if val_dot is not None:
             val_dot.set_data([time[i]], [values[i]])
             artists_out = (*artists_out, val_dot)
@@ -366,7 +507,19 @@ def main():
     )
     parser.add_argument(
         "--seed", type=int, default=42,
-        help="Random seed for the rollout initial state (default: 42)",
+        help="Random seed (single-rollout mode; default: 42)",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=100,
+        help="Number of rollouts to render and save. 1 → interactive show. (default: 100)",
+    )
+    parser.add_argument(
+        "--seed-start", type=int, default=0,
+        help="First seed to use in batch mode (default: 0)",
+    )
+    parser.add_argument(
+        "--output-dir", default="result",
+        help="Folder (relative to this file) to save GIFs into (default: result)",
     )
     args = parser.parse_args()
 
@@ -397,12 +550,51 @@ def main():
         )
         title = f"Quadrotor 2-D — Two-Stage Controller ({args.algo.upper()})"
 
-    env = Quadrotor2DEnv(dt=0.01, max_time=4.0)
-    print("Running rollout …")
-    states, actions, values, dt = rollout(model, env, seed=args.seed)
-    print(f"Episode length: {len(states)} steps  ({len(states) * dt:.2f} s)")
+    if args.batch <= 1:
+        env = Quadrotor2DEnv(dt=0.01, max_time=10.0)
+        print("Running rollout …")
+        states, actions, values, dt, modes, references = rollout(
+            model, env, seed=args.seed
+        )
+        print(f"Episode length: {len(states)} steps  ({len(states) * dt:.2f} s)")
+        animate(
+            states, actions, dt,
+            values=values,
+            modes=modes,
+            references=references,
+            title=title,
+        )
+        return
 
-    animate(states, actions, dt, values=values, title=title)
+    # ── Batch mode: render N rollouts to GIF, headless. ─────────────────────
+    import matplotlib as _mpl
+    _mpl.use("Agg", force=True)
+    plt.close("all")
+
+    output_dir = os.path.join(here, args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Saving {args.batch} GIFs to {output_dir}")
+
+    for i in range(args.batch):
+        seed = args.seed_start + i
+        env = Quadrotor2DEnv(dt=0.01, max_time=10.0)
+        states, actions, values, dt, modes, references = rollout(
+            model, env, seed=seed
+        )
+        gif_path = os.path.join(output_dir, f"rollout_seed_{seed:04d}.gif")
+        animate(
+            states, actions, dt,
+            values=values,
+            modes=modes,
+            references=references,
+            title=f"{title}  |  seed={seed}",
+            save_path=gif_path,
+        )
+        plt.close("all")
+        print(
+            f"[{i + 1}/{args.batch}] saved {gif_path}  "
+            f"({len(states)} steps, {len(states) * dt:.2f}s)"
+        )
 
 
 if __name__ == "__main__":

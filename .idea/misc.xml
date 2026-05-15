@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="generalized_neural_stability" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="quadrotorRL" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="generalized_neural_stability" project-jdk-type="Python SDK" />
 </project>
